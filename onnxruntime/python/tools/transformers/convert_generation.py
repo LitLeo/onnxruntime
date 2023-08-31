@@ -87,6 +87,7 @@ class GenerationType(Enum):
     BEAMSEARCH = "beam_search"
     GREEDYSEARCH = "greedy_search"
     SAMPLING = "sampling"
+    BEAMSAMPLE = "beam_sample"
 
     def __str__(self):
         return self.value
@@ -363,6 +364,13 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
         required=False,
         default=1.0,
         help="Top P for sampling",
+    )
+
+    beam_parameters_group.add_argument(
+        "--do_sample",
+        required=False,
+        action="store_true",
+        help="do_sample for beam sampling",
     )
 
     beam_parameters_group.add_argument(
@@ -1824,6 +1832,7 @@ def convert_generation_model(args: argparse.Namespace, generation_type: Generati
     is_beamsearch: bool = generation_type == GenerationType.BEAMSEARCH
     is_greedysearch: bool = generation_type == GenerationType.GREEDYSEARCH
     is_sampling: bool = generation_type == GenerationType.SAMPLING
+    is_beamsample: bool = generation_type == GenerationType.BEAMSAMPLE
     past_present_share_buffer: bool = args.past_present_share_buffer
 
     logger.info(f"**** past_present_share_buffer={past_present_share_buffer}")
@@ -1842,6 +1851,9 @@ def convert_generation_model(args: argparse.Namespace, generation_type: Generati
             raise NotImplementedError("output_sequences_scores currently is not supported in greedy search/sampling")
         if args.output_token_scores:
             raise NotImplementedError("output_token_scores currently is not supported in greedy search/sampling")
+
+    if is_beamsample and is_gpt2:
+        raise NotImplementedError("Currently only t5 with beam_sample is supported")
 
     # For BeamSearch, sharing buffers for past and present states is only supported
     # when using `use_decoder_masked_attention`
@@ -1995,6 +2007,16 @@ def convert_generation_model(args: argparse.Namespace, generation_type: Generati
             "length_penalty",
             "repetition_penalty",
         ]
+    elif is_beamsample:
+        inputs = [
+            "input_ids",
+            "max_length",
+            "min_length",
+            "num_beams",
+            "num_return_sequences",
+            "length_penalty",
+            "repetition_penalty",
+        ]
     elif is_greedysearch or is_sampling:
         inputs = [
             "input_ids",
@@ -2057,6 +2079,13 @@ def convert_generation_model(args: argparse.Namespace, generation_type: Generati
             outputs=outputs,
             name=f"Sampling_{args.model_type}",
         )
+    elif is_beamsample:
+        node = onnx.helper.make_node(
+            "BeamSample",
+            inputs=inputs,
+            outputs=outputs,
+            name=f"BeamSample_{args.model_type}",
+        )
 
     node.domain = "com.microsoft"
 
@@ -2088,6 +2117,16 @@ def convert_generation_model(args: argparse.Namespace, generation_type: Generati
             onnx.helper.make_attribute("min_tokens_to_keep", args.min_tokens_to_keep),
             onnx.helper.make_attribute("custom", args.custom),
             onnx.helper.make_attribute("presence_penalty", args.presence_penalty),
+        ]
+    elif is_beamsample:
+        attr_to_extend = [
+            onnx.helper.make_attribute("eos_token_id", eos_token_id),
+            onnx.helper.make_attribute("pad_token_id", pad_token_id),
+            onnx.helper.make_attribute("no_repeat_ngram_size", args.no_repeat_ngram_size),
+            onnx.helper.make_attribute("early_stopping", 1 if args.early_stopping else 0),
+            onnx.helper.make_attribute("model_type", 0 if args.model_type == "gpt2" else 1),
+            onnx.helper.make_attribute("temperature", args.temperature),
+            onnx.helper.make_attribute("top_p", args.top_p),
         ]
 
     # Explicitly pass in the vocab size via an attribute
@@ -2204,6 +2243,7 @@ def convert_generation_model(args: argparse.Namespace, generation_type: Generati
     num_return_sequences = onnx.helper.make_tensor_value_info("num_return_sequences", TensorProto.INT32, [1])
     length_penalty = onnx.helper.make_tensor_value_info("length_penalty", TensorProto.FLOAT, [1])
     repetition_penalty = onnx.helper.make_tensor_value_info("repetition_penalty", TensorProto.FLOAT, [1])
+    top_k = onnx.helper.make_tensor_value_info("top_k", TensorProto.INT32, [1])
 
     graph_inputs = None
     if is_beamsearch:
@@ -2222,6 +2262,17 @@ def convert_generation_model(args: argparse.Namespace, generation_type: Generati
             max_length,
             min_length,
             repetition_penalty,
+        ]
+    elif is_beamsample:
+        graph_inputs = [
+            input_ids,
+            max_length,
+            min_length,
+            num_beams,
+            num_return_sequences,
+            length_penalty,
+            repetition_penalty,
+            top_k
         ]
 
     if args.vocab_mask:
@@ -2263,6 +2314,12 @@ def convert_generation_model(args: argparse.Namespace, generation_type: Generati
             "sequences",
             TensorProto.INT32,
             ["batch_size", "max_length"],
+        )
+    elif is_beamsample:
+        sequences = onnx.helper.make_tensor_value_info(
+            "sequences",
+            TensorProto.INT32,
+            ["batch_size", "num_return_sequences", "max_length"],
         )
 
     graph_outputs = [sequences]
@@ -2834,7 +2891,10 @@ def main(argv: Optional[List[str]] = None, sentences: Optional[List[str]] = None
         else:
             convert_generation_model(args, GenerationType.GREEDYSEARCH)
     else:
-        convert_generation_model(args)
+        if args.num_beams > 1:
+            convert_generation_model(args, GenerationType.BEAMSEARCH)
+        if args.do_sample and args.num_beams > 1:
+            convert_generation_model(args, GenerationType.BEAMSAMPLE)
 
     logger.info("start testing model...")
     if args.model_type in ["t5", "mt5"]:
